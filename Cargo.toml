@@ -1,0 +1,7 @@
+[package]
+name = "let_match"
+version = "0.1.0"
+authors = ["pierzchalski <edward@pierzchalski.org>"]
+
+[dependencies]
+let_match_macro = { path = "let_match_macro" }

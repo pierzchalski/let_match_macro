@@ -1,0 +1,18 @@
+[package]
+authors = ["pierzchalski <edward@pierzchalski.org>"]
+name = "let_match_macro"
+version = "0.1.0"
+
+[dependencies]
+quote = "0.4.2"
+
+[dependencies.syn]
+version = "0.12.12"
+features = ["full", "extra-traits"]
+
+[dependencies.proc-macro2]
+version = "0.2.2"
+features = ["nightly"]
+
+[lib]
+proc-macro = true
