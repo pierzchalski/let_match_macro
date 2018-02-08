@@ -16,7 +16,13 @@ use syn::{Pat, Expr, Arm, Ident};
 struct LetMatch {
     pat: Pat,
     expr: Expr,
-    matches: Vec<Arm>,
+    body: Body,
+}
+
+#[derive(Debug)]
+enum Body {
+    Arms(Vec<Arm>),
+    Expr(Expr),
 }
 
 impl Synom for LetMatch {
@@ -26,28 +32,195 @@ impl Synom for LetMatch {
         punct!(=) >>
         expr: syn!(Expr) >>
         keyword!(else) >>
-        keyword!(match) >>
-        matches: map!(
-            braces!(many0!(syn!(Arm))),
-            |(_parens, arms)| arms.into_iter().collect()
+        body: alt!(
+            syn!(Expr) => { Body::Expr }
+            |
+            do_parse!(
+                keyword!(match) >>
+                arms: map!(
+                    braces!(many0!(syn!(Arm))),
+                    |(_parens, arms)| arms.into_iter().collect()
+                ) >>
+                (Body::Arms(arms))
+            )
         ) >>
         (LetMatch {
-            pat, expr, matches
+            pat, expr, body
         })
     ));
 }
 
+/// Allow 'let unless' syntax:
+/// 
+/// ```ignore
+/// let <pat: PAT> = <expr: EXPR> else <body: EXPR>;
+///
+/// // Expands into:
+/// let pat = match expr {
+///     pat => pat,
+///     _ => {let _: ! = body },
+/// };
+/// ```
+///
+/// ```ignore
+/// let <pat: PAT> = <expr: EXPR> else match {
+///     (<match_pat: PAT> => <match_body: EXPR>),*
+/// };
+/// 
+/// // Expands into:
+/// let pat = match expr {
+///     pat => pat,
+///     (match_pat => { let _: ! = match_body }),*
+/// }
+///
+/// ```
+///
+/// Notice that the failing body/non-successful match cases are
+/// required to be divergent.
+///
+/// # Requirements
+///
+/// This is provided as a proc macro, and it uses the `!` type internally.
+/// This means you need to add the following to any crates using `m!`:
+///
+/// ```ignore
+/// #![feature(proc_macro, never_type)]
+/// 
+/// extern crate let_match_macro;
+/// use let_match_macro::m;
+/// ```
+///
+/// # Examples
+/// 
+/// We'll be using the following enum to show things off:
+///
+/// ```
+/// #[derive(Debug)]
+/// enum Example {
+///     A(String),
+///     B {
+///         x: String,
+///         y: u32,
+///     },
+///     C(u32, u32),
+/// }
+/// ```
+///
+/// Fairly complicated match patterns are supported:
+///
+/// ```
+/// # #![feature(proc_macro, never_type)]
+/// #
+/// # extern crate let_match_macro;
+/// # use let_match_macro::m;
+/// #
+/// # #[derive(Debug)]
+/// # enum Example {
+/// #     A(String),
+/// #     B {
+/// #         x: String,
+/// #         y: u32,
+/// #     },
+/// #     C(u32, u32),
+/// # }
+/// # use self::Example::*;
+/// #
+/// # fn main() {
+/// let mut e = B { x: "Hello".into(), y: 5 };
+///
+/// m!(let A(ref mut x) = e else match {
+///     b @ B { .. } => {
+///         println!("handling B case: {:#?}", b);
+///         return;
+///     },
+///     C(x, y) => {
+///         panic!("need to diverge...");
+///     },
+/// });
+///
+/// x.push_str(" world!");
+/// assert_eq!(*x, "Hello world!".to_string());
+/// # }
+/// ```
+///
+/// You don't need to pattern-match to handle match failure:
+///
+/// ```should_panic
+/// # #![feature(proc_macro, never_type)]
+/// #
+/// # extern crate let_match_macro;
+/// # use let_match_macro::m;
+/// #
+/// # #[derive(Debug)]
+/// # enum Example {
+/// #     A(String),
+/// #     B {
+/// #         x: String,
+/// #         y: u32,
+/// #     },
+/// #     C(u32, u32),
+/// # }
+/// # use self::Example::*;
+/// #
+/// # fn main() {
+/// let mut e = B { x: "Hello".into(), y: 5 };
+///
+/// m!(let A(x) = e else {
+///     panic!("Nah, not dealing with this");
+/// });
+/// # }
+/// ```
+///
+/// This will fail because not all of the match arms diverge:
+///
+/// ```compile_fail
+/// # #![feature(proc_macro, never_type)]
+/// #
+/// # extern crate let_match_macro;
+/// # use let_match_macro::m;
+/// #
+/// # #[derive(Debug)]
+/// # enum Example {
+/// #     A(String),
+/// #     B {
+/// #         x: String,
+/// #         y: u32,
+/// #     },
+/// #     C(u32, u32),
+/// # }
+/// # use self::Example::*;
+/// #
+/// # fn main() {
+/// let mut e = B { x: "Hello".into(), y: 5 };
+///
+/// m!(let C(x, _) = e else match {
+///     A(msg) => {
+///         println!("handling A case: {}", msg);
+///         // x is of type u32, but we don't let
+///         // other branches 'succeed': every branch
+///         // here must diverge.
+///         0u32
+///     },
+///     b @ B { .. } => {
+///         println!("handling B case: {:#?}", b);
+///         return;
+///     },
+/// });
+/// # }
+///
+/// ```
 #[proc_macro]
 pub fn m(input: TokenStream) -> TokenStream {
     let LetMatch {
-        pat, expr, matches
+        pat, expr, body 
     } = syn::parse(input).unwrap();
 
-    let bindings = refutable_to_irrefutable(&pat);
+    let idents_tuple = pat_to_bindings(&pat);
+    let matches = body_to_matches(body);
 
     let result = quote!(
-        let #bindings = match #expr {
-            #pat => #bindings,
+        let #idents_tuple = match #expr {
+            #pat => #idents_tuple,
             #(#matches)*
         };
     );
@@ -55,42 +228,47 @@ pub fn m(input: TokenStream) -> TokenStream {
     result.into()
 }
 
-// Convert refutable patterns like the following:
-//
-// Ok(x), T {a, b: c}
-//
-// Into irrefutable patterns like
-//
-// (x), (a, c)
-//
-// Thankfully, we don't need to actually preserve ordering since
-// we just use the same bindings twice.
-fn refutable_to_irrefutable(pat: &Pat) -> Pat {
-    let idents = bindings(&pat);
-    let pat = quote!( (#(#idents,)*) );
-    syn::parse(pat.into()).unwrap()
+fn body_to_matches(body: Body) -> Vec<Arm> {
+    match body {
+        Body::Arms(arms) =>
+            arms.into_iter().map(|mut arm| {
+                let body = arm.body;
+                arm.body = Box::new(
+                    parse_quote!(
+                        {let _: ! = #body;}
+                    )
+                );
+                arm
+            }).collect(),
+        Body::Expr(expr) => 
+            vec!(
+                parse_quote!(
+                    _ => {let _: ! = #expr;}
+                )
+            ),
+    }
 }
 
-// Collects variable bindings in patterns. For example:
-//
-// Struct { a, b: ref mut c } => a, c
-//
-// Thankfully, we don't need to actually preserve ordering since
-// we just use the same bindings twice.
+fn pat_to_bindings(pat: &Pat) -> Pat {
+    let bindings = bindings(pat);
+    parse_quote!((#(#bindings,)*))
+}
+
 fn bindings(pat: &Pat) -> Vec<Ident> {
     fn tuple_bindings(pat: &syn::PatTuple) -> Vec<Ident> {
-        pat.front.iter()
-            .flat_map(|pat| bindings(&pat))
-            .chain(pat.back.iter()
-                   .flat_map(|pat| bindings(&pat)))
-            .collect()
+        let front = pat.front.iter()
+            .flat_map(|pat| bindings(&pat));
+        let back = pat.back.iter()
+            .flat_map(|pat| bindings(&pat));
+        front.chain(back).collect()
     }
     match *pat {
         Pat::Ident(ref pat) => {
-            let mut idents = pat.subpat.as_ref()
+            let mut idents = vec![pat.ident.clone()];
+            let subpat_idents = pat.subpat.as_ref()
                 .map(|&(_ampersand, ref subpat)| bindings(&subpat))
                 .unwrap_or_else(Vec::new);
-            idents.push(pat.ident);
+            idents.extend(subpat_idents);
             idents
         },
         Pat::Struct(ref pat) => {

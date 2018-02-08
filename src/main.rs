@@ -1,4 +1,4 @@
-#![feature(proc_macro)]
+#![feature(proc_macro, never_type)]
 
 extern crate let_match_macro;
 

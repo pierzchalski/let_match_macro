@@ -1,3 +1,4 @@
 
 /target
+/let_match_macro/target
 **/*.rs.bk
