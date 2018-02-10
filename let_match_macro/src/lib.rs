@@ -25,6 +25,21 @@ enum Body {
     Expr(Expr),
 }
 
+impl Synom for Body {
+    named!(parse -> Self, alt!(
+        syn!(Expr) => { Body::Expr }
+        |
+        do_parse!(
+            keyword!(match) >>
+            arms: map!(
+                braces!(many0!(syn!(Arm))),
+                |(_parens, arms)| arms.into_iter().collect()
+            ) >>
+            (Body::Arms(arms))
+        )
+    ));
+}
+
 impl Synom for LetMatch {
     named!(parse -> Self, do_parse!(
         keyword!(let) >>
@@ -32,18 +47,7 @@ impl Synom for LetMatch {
         punct!(=) >>
         expr: syn!(Expr) >>
         keyword!(else) >>
-        body: alt!(
-            syn!(Expr) => { Body::Expr }
-            |
-            do_parse!(
-                keyword!(match) >>
-                arms: map!(
-                    braces!(many0!(syn!(Arm))),
-                    |(_parens, arms)| arms.into_iter().collect()
-                ) >>
-                (Body::Arms(arms))
-            )
-        ) >>
+        body: syn!(Body) >>
         (LetMatch {
             pat, expr, body
         })
