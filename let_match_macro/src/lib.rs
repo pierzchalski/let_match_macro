@@ -10,7 +10,7 @@ extern crate proc_macro2;
 use proc_macro::TokenStream;
 
 use syn::synom::Synom;
-use syn::{Pat, Expr, Arm, Ident};
+use syn::{Pat, Expr, Arm, PatIdent};
 
 #[derive(Debug)]
 struct LetMatch {
@@ -83,11 +83,12 @@ impl Synom for LetMatch {
 /// This is provided as a proc macro, and it uses the `!` type internally.
 /// This means you need to add the following to any crates using `m!`:
 ///
-/// ```ignore
+/// ```
 /// #![feature(proc_macro, never_type)]
 /// 
 /// extern crate let_match_macro;
 /// use let_match_macro::m;
+/// # fn main() {}
 /// ```
 ///
 /// # Examples
@@ -209,18 +210,51 @@ impl Synom for LetMatch {
 /// # }
 ///
 /// ```
+///
+/// ```hidden
+/// # #![feature(proc_macro, never_type)]
+/// #
+/// # extern crate let_match_macro;
+/// # use let_match_macro::m;
+/// #
+/// # #[derive(Debug)]
+/// # enum Example {
+/// #     A(String),
+/// #     B {
+/// #         x: String,
+/// #         y: u32,
+/// #     },
+/// #     C(u32, u32),
+/// # }
+/// # use self::Example::*;
+/// #
+/// # fn main() {
+/// let mut e = B { x: "Hello".into(), y: 5 };
+///
+/// m!(let B {mut x, mut y} = e else match {
+///     other => panic!(format!("Nah, not dealing with this: {:#?}", other)),
+/// });
+///
+/// // Asserting that x and y have the expected mutability:
+/// x.push_str(", world!");
+/// y = 6;
+///
+/// // Asserting that x and y have the expected types:
+/// let _x: String = x;
+/// let _y: u32 = y;
+/// # }
 #[proc_macro]
 pub fn m(input: TokenStream) -> TokenStream {
     let LetMatch {
         pat, expr, body 
     } = syn::parse(input).unwrap();
 
-    let idents_tuple = pat_to_bindings(&pat);
+    let (tuple_expr, tuple_pat) = pat_to_tuple_bindings(&pat);
     let matches = body_to_matches(body);
 
     let result = quote!(
-        let #idents_tuple = match #expr {
-            #pat => #idents_tuple,
+        let #tuple_pat = match #expr {
+            #pat => #tuple_expr,
             #(#matches)*
         };
     );
@@ -249,31 +283,62 @@ fn body_to_matches(body: Body) -> Vec<Arm> {
     }
 }
 
-fn pat_to_bindings(pat: &Pat) -> Pat {
-    let bindings = bindings(pat);
-    parse_quote!((#(#bindings,)*))
+/// Turns a pattern into a tuple of bidings
+/// as well as a pattern to match against that tuple.
+/// Preserves mutability, that is the following pattern:
+///
+/// ```ignore
+/// S { ref mut x, mut y }
+/// ```
+///
+/// Produces a tuple expression `(x, y)` and a tuple pattern
+/// `(x, mut y)`. This allows matching the tuple against the
+/// tuple pattern to return the same types and mutability as
+/// the bindings in the original pattern.
+fn pat_to_tuple_bindings(pat: &Pat) -> (Expr, Pat) {
+    let bindings = pat_bindings(pat);
+    let mut expr = Vec::new();
+    let mut pat = Vec::new();
+
+    for PatIdent { by_ref, mutability, ident, .. } in bindings.into_iter() {
+        expr.push(ident.clone());
+        pat.push(match by_ref {
+            Some(_) => PatIdent {
+                ident, by_ref: None, mutability: None, subpat: None,
+            },
+            None => PatIdent {
+                mutability, ident, by_ref: None, subpat: None,
+            },
+        });
+    };
+
+    let expr = parse_quote!((#(#expr,)*));
+    let pat = parse_quote!((#(#pat,)*));
+    (expr, pat)
 }
 
-fn bindings(pat: &Pat) -> Vec<Ident> {
-    fn tuple_bindings(pat: &syn::PatTuple) -> Vec<Ident> {
+fn pat_bindings(pat: &Pat) -> Vec<PatIdent> {
+    fn tuple_bindings(pat: &syn::PatTuple) -> Vec<PatIdent> {
         let front = pat.front.iter()
-            .flat_map(|pat| bindings(&pat));
+            .flat_map(|pat| pat_bindings(&pat));
         let back = pat.back.iter()
-            .flat_map(|pat| bindings(&pat));
+            .flat_map(|pat| pat_bindings(&pat));
         front.chain(back).collect()
     }
     match *pat {
         Pat::Ident(ref pat) => {
-            let mut idents = vec![pat.ident.clone()];
-            let subpat_idents = pat.subpat.as_ref()
-                .map(|&(_ampersand, ref subpat)| bindings(&subpat))
+            let mut binding = pat.clone();
+            binding.subpat = None;
+            let mut bindings = vec![binding];
+            let subpat_bindings = pat.subpat.as_ref()
+                .map(|&(_ampersand, ref subpat)| pat_bindings(&subpat))
                 .unwrap_or_else(Vec::new);
-            idents.extend(subpat_idents);
-            idents
+            bindings.extend(subpat_bindings);
+            bindings
         },
         Pat::Struct(ref pat) => {
             pat.fields.iter()
-                .flat_map(|field| bindings(&field.pat))
+                .flat_map(|field| pat_bindings(&field.pat))
                 .collect()
         },
         Pat::TupleStruct(ref pat) => {
